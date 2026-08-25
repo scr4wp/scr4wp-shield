@@ -49,7 +49,7 @@ Requirements:
 -   systemd-resolved
 -   Tor
 
-Install:
+## Install:
 
 ``` bash
 sudo cp scr4wp-shield /usr/local/sbin/scr4wp-shield
@@ -61,6 +61,13 @@ Check:
 ``` bash
 sudo scr4wp-shield status
 ```
+
+## Uninstall
+
+```bash
+sudo rm -f /usr/local/sbin/scr4wp-shield
+sudo rm -rf /var/lib/scr4wp-shield
+sudo rm -rf /etc/scr4wp-shield
 
 ------------------------------------------------------------------------
 
