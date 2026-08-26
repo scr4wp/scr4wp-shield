@@ -177,7 +177,11 @@ administration.
 
 # 📜 License
 
-MIT License
+GNU General Public License v3.0
+
+SCR4WP Shield is licensed under the GPL-3.0 license.
+
+See the [LICENSE](LICENSE) file for details.
 
 ------------------------------------------------------------------------
 
