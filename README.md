@@ -64,24 +64,27 @@ sudo scr4wp-shield status
 
 ## Uninstall
 
+Remove SCR4WP Shield:
+
 ```bash
 sudo rm -f /usr/local/sbin/scr4wp-shield
 sudo rm -rf /var/lib/scr4wp-shield
 sudo rm -rf /etc/scr4wp-shield
+```
 
-------------------------------------------------------------------------
+---
 
 # ⚡ Usage
 
 ## Enable OPSEC
 
-``` bash
+```bash
 sudo scr4wp-shield opsec
 ```
 
 Verify:
 
-``` bash
+```bash
 sudo scr4wp-shield verify
 ```
 
