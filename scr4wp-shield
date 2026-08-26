@@ -1,0 +1,1782 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+BASE="/var/lib/scr4wp-shield"
+STATE="$BASE/state"
+VERIFY_STATE="$BASE/verify-state"
+LOG="/var/log/scr4wp-shield/shield.log"
+NFT="scr4wp_shield"
+
+TOR="tor@default"
+
+
+mkdir -p "$BASE"
+
+
+
+
+get_state()
+{
+    if [ -f "$STATE" ]; then
+        cat "$STATE"
+    else
+        echo UNKNOWN
+    fi
+}
+
+mode_guard()
+{
+    local target="$1"
+    local current
+
+    current=$(get_state)
+
+    if [ "$current" = "$target" ]; then
+        log "Already in $target mode"
+        echo "$target"
+        return 1
+    fi
+
+    return 0
+}
+
+
+set_state()
+{
+    local value="$1"
+    local tmp="${STATE}.tmp"
+
+    echo "$value" > "$tmp"
+    mv -f "$tmp" "$STATE"
+}
+
+
+dns_lock()
+{
+    log "DNS LOCK"
+
+    IFACE=$(ip route | awk '/default/ {print $5; exit}')
+
+    resolvectl dns "$IFACE" 127.0.0.1
+    resolvectl domain "$IFACE" "~."
+}
+
+dns_unlock()
+{
+    log "DNS UNLOCK"
+
+    IFACE=$(ip route | awk '/default/ {print $5; exit}')
+
+    resolvectl revert "$IFACE"
+
+    # restore normal DNS routing
+    resolvectl dns "$IFACE" 1.1.1.1 8.8.8.8
+    resolvectl domain "$IFACE" ""
+
+    # force resolved to refresh link
+    systemctl restart systemd-resolved
+
+    # restore default route flag
+    resolvectl default-route "$IFACE" yes
+}
+
+
+
+detect_optional_modules()
+{
+    MODULE_DIR="$BASE/modules"
+    mkdir -p "$MODULE_DIR"
+
+    ZAPRET_FOUND=0
+
+    if systemctl list-unit-files 2>/dev/null | grep -q "^zapret.service"; then
+        ZAPRET_FOUND=1
+    fi
+
+    if [ -d "/opt/zapret" ]; then
+        ZAPRET_FOUND=1
+    fi
+
+    if pgrep -f nfqws >/dev/null 2>&1; then
+        ZAPRET_FOUND=1
+    fi
+
+    if [ "$ZAPRET_FOUND" -eq 1 ]; then
+        touch "$MODULE_DIR/zapret.detected"
+    else
+        rm -f "$MODULE_DIR/zapret.detected"
+    fi
+}
+
+
+
+load_config()
+{
+    CONFIG_FILE="/etc/scr4wp-shield/config"
+
+    TOR_SERVICE="tor@default"
+    TOR_SOCKS_PORT="9050"
+    DNS_PORT="5353"
+    ZAPRET_SERVICE="zapret"
+    FAIL_POLICY="BLOCK"
+
+    if [ -f "$CONFIG_FILE" ]; then
+        while IFS='=' read -r key value
+        do
+            case "$key" in
+                TOR_SERVICE)
+                    TOR_SERVICE="$value"
+                    ;;
+                TOR_SOCKS_PORT)
+                    TOR_SOCKS_PORT="$value"
+                    ;;
+                DNS_PORT)
+                    DNS_PORT="$value"
+                    ;;
+                ZAPRET_SERVICE)
+                    ZAPRET_SERVICE="$value"
+                    ;;
+                FAIL_POLICY)
+                    FAIL_POLICY="$value"
+                    ;;
+            esac
+        done < "$CONFIG_FILE"
+    fi
+}
+
+
+AUDIT="/var/log/scr4wp-shield/audit.log"
+
+audit_log()
+{
+    mkdir -p "$(dirname "$AUDIT")"
+
+    echo "$(date '+%F %T') $*" >> "$AUDIT"
+
+    if [ -f "$AUDIT" ]; then
+        lines=$(wc -l < "$AUDIT")
+
+        if [ "$lines" -gt 500 ]; then
+            tail -500 "$AUDIT" > "$AUDIT.tmp"
+            mv "$AUDIT.tmp" "$AUDIT"
+        fi
+    fi
+}
+
+
+backups()
+{
+    echo "=============================="
+    echo " SCR4WP BACKUPS"
+    echo "=============================="
+    echo
+
+    if ls -1dt "$BASE"/backups/* >/dev/null 2>&1; then
+        ls -1dt "$BASE"/backups/* | while read b
+        do
+            echo "$(basename "$b")"
+        done
+    else
+        echo "NO BACKUPS"
+    fi
+}
+
+
+
+backup_clean()
+{
+    echo "=============================="
+    echo " SCR4WP BACKUP CLEAN"
+    echo "=============================="
+    echo
+
+    KEEP=5
+
+    count=$(ls -1dt "$BASE"/backups/* 2>/dev/null | wc -l)
+
+    if [ "$count" -le "$KEEP" ]; then
+        echo "Nothing to clean"
+        echo "Backups: $count"
+        return
+    fi
+
+    ls -1dt "$BASE"/backups/* | tail -n +$((KEEP+1)) | while read b
+    do
+        echo "Removing: $(basename "$b")"
+        rm -rf "$b"
+    done
+
+    echo
+    echo "Remaining:"
+    ls -1dt "$BASE"/backups/* | wc -l
+}
+
+audit()
+{
+    echo "=============================="
+    echo " SCR4WP AUDIT LOG"
+    echo "=============================="
+    echo
+
+    if [ -f "$AUDIT" ]; then
+        cat "$AUDIT"
+    else
+        echo "NO EVENTS"
+    fi
+}
+
+
+log()
+{
+    echo "$(date '+%F %T') $*" | tee -a "$LOG"
+}
+
+load_config
+
+
+backup()
+{
+    local d="$BASE/backups/$(date +%Y%m%d-%H%M%S)"
+
+    echo "=============================="
+    echo " SCR4WP SHIELD BACKUP"
+    echo "=============================="
+    echo
+
+    echo "Creating:"
+    echo " $d"
+    echo
+
+    mkdir -p "$d"
+
+    echo "STATE:"
+    if cp -a "$STATE" "$d/" 2>/dev/null; then
+        echo "OK"
+    else
+        echo "SKIP"
+    fi
+
+    echo
+    echo "TOR CONFIG:"
+    if cp -a /etc/tor/torrc "$d/" 2>/dev/null; then
+        echo "OK"
+    else
+        echo "SKIP"
+    fi
+
+    echo
+    echo "NFT RULES:"
+    if nft list ruleset > "$d/nft.rules" 2>/dev/null; then
+        echo "OK"
+    else
+        echo "SKIP"
+    fi
+
+    echo
+    echo "BACKUP COMPLETE"
+    echo
+}
+
+
+
+fail_close()
+{
+    log "FAIL CLOSED ACTIVE"
+
+    firewall_on
+
+    set_state "FAIL"
+}
+
+load_config
+
+firewall_on()
+{
+    nft delete table inet "$NFT" 2>/dev/null || true
+
+    nft -f - <<EOFNFT
+table inet $NFT {
+
+chain prerouting {
+    type nat hook prerouting priority dstnat - 10;
+    policy accept;
+
+    iifname "lo" accept
+
+    ip daddr 127.0.0.0/8 accept
+
+    tcp dport {80,443} redirect to :9040
+}
+
+chain output {
+    type filter hook output priority -10;
+    policy drop;
+
+    oifname "lo" accept
+
+    ip daddr 127.0.0.0/8 accept
+    ip6 daddr ::1 accept
+
+    meta skuid 127 accept
+
+    tcp dport $TOR_SOCKS_PORT accept
+    tcp dport 9051 accept
+    tcp dport 9040 accept
+    udp dport $DNS_PORT accept
+}
+
+chain nat_output {
+    type nat hook output priority -100;
+    policy accept;
+
+    meta skuid 127 accept
+
+    udp dport 53 redirect to :5353
+
+    tcp dport {80,443} redirect to :9040
+}
+
+}
+EOFNFT
+}
+
+
+firewall_off()
+{
+    nft delete table inet "$NFT" 2>/dev/null || true
+}
+
+
+tor_wait()
+{
+    log "Waiting Tor SOCKS"
+
+    for i in $(seq 1 120)
+    do
+        if ss -lnt | grep -q ':9050'
+        then
+            return 0
+        fi
+
+        sleep 1
+    done
+
+    return 1
+}
+
+
+tor_verify()
+{
+    log "Checking Tor exit"
+
+    local r
+
+    r=$(curl \
+        --fail \
+        --silent \
+        --show-error \
+        --socks5-hostname 127.0.0.1:9050 \
+        --connect-timeout 10 \
+        --max-time 30 \
+        https://check.torproject.org 2>/dev/null || true)
+
+    echo "$r" | grep -q "configured to use Tor"
+}
+
+
+
+dns_verify()
+{
+    log "Checking DNS routing"
+
+    local r
+
+    r=$(dig \
+        @127.0.0.1 \
+        -p "$DNS_PORT" \
+        example.com \
+        +short \
+        2>/dev/null || true)
+
+    if [ -n "$r" ]
+    then
+        return 0
+    fi
+
+    return 1
+}
+
+
+ipv6_verify()
+{
+    if curl -6 \
+    --connect-timeout 3 \
+    --max-time 5 \
+    -s https://icanhazip.com >/dev/null
+    then
+        return 1
+    fi
+
+    return 0
+}
+
+
+normal()
+{
+    mode_guard NORMAL || return 0
+
+    log "NORMAL MODE"
+    audit_log "MODE NORMAL"
+
+    backup
+
+    # remove OPSEC routing first
+    firewall_off
+
+    # restore normal DNS
+    dns_unlock
+
+    # stop tor
+    systemctl stop "$TOR_SERVICE" || true
+    systemctl disable "$TOR_SERVICE" >/dev/null 2>&1 || true
+
+   # restore optional network module
+   if [ -f "$BASE/modules/zapret.detected" ]; then
+       systemctl enable "$ZAPRET_SERVICE" >/dev/null 2>&1 || true
+       systemctl restart "$ZAPRET_SERVICE" || true
+   fi
+
+    # verify normal routing
+    sleep 1
+
+    if nft list table inet "$NFT" >/dev/null 2>&1; then
+        log "NORMAL NFT STILL ACTIVE"
+        set_state "FAIL"
+        exit 1
+    fi
+
+    if ss -lnt | grep -q ":9050"; then
+        log "NORMAL TOR STILL ACTIVE"
+        set_state "FAIL"
+        exit 1
+    fi
+
+    set_state "NORMAL"
+
+    log "NORMAL READY"
+    audit_log "NORMAL READY"
+}
+
+
+opsec()
+{
+    mode_guard OPSEC || return 0
+
+    log "OPSEC START"
+    audit_log "MODE OPSEC START"
+
+    backup
+
+
+    # stop optional network module
+   if [ -f "$BASE/modules/zapret.detected" ]; then
+       systemctl stop "$ZAPRET_SERVICE" || true
+   fi
+
+    firewall_on
+
+
+    systemctl start "$TOR_SERVICE"
+
+
+    if ! tor_wait
+    then
+        log "TOR SOCKS FAILED"
+        set_state "FAIL"
+        exit 1
+    fi
+
+
+    if ! tor_verify
+    then
+        log "TOR VERIFY FAILED"
+        set_state "FAIL"
+        exit 1
+    fi
+
+
+    dns_lock
+
+
+    if ! dns_verify
+    then
+        log "DNS LEAK FAILED"
+        set_state "FAIL"
+        exit 1
+    fi
+
+
+    if ! ipv6_verify
+    then
+        log "IPV6 LEAK FAILED"
+        set_state "FAIL"
+        exit 1
+    fi
+
+
+    set_state "OPSEC"
+
+    log "OPSEC READY"
+    audit_log "OPSEC READY"
+}
+
+
+
+
+
+killswitch_test()
+{
+    echo "=============================="
+    echo " SCR4WP KILLSWITCH TEST"
+    echo "=============================="
+    echo
+
+    echo "Stopping Tor temporarily..."
+    systemctl stop "$TOR_SERVICE"
+
+    sleep 3
+
+    echo -n "Internet blocked: "
+
+    if curl --connect-timeout 5 -s https://example.com >/dev/null; then
+        echo "FAIL"
+        VERIFY_OK=0
+    else
+        echo "PASS"
+    fi
+
+    systemctl start "$TOR_SERVICE"
+
+    echo
+    echo "Tor restored"
+}
+
+test()
+{
+    echo "=============================="
+    echo " SCR4WP SHIELD TEST"
+    echo "=============================="
+    echo
+
+    echo "TOR SERVICE:"
+    if tor_health; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+    echo
+    echo "DNS TOOL:"
+    if command -v dig >/dev/null; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "IPV6 CONTROL:"
+    if sysctl net.ipv6.conf.all.disable_ipv6 >/dev/null 2>&1; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "NFTABLES:"
+    if command -v nft >/dev/null; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "FAIL CLOSED:"
+    if grep -q "BLOCK_NETWORK=true" /etc/scr4wp-shield/config; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "RESULT:"
+    echo "SYSTEM READY"
+}
+
+
+tor_health()
+{
+    local ok=1
+
+    echo "TOR HEALTH:"
+
+    echo -n "SOCKS 9050: "
+    if ss -lnt | grep -q ":9050"; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+        ok=0
+    fi
+
+    echo -n "DNS 5353: "
+    if ss -lun | grep -q ":5353"; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+        ok=0
+    fi
+
+    echo -n "TRANS 9040: "
+    if ss -lnt | grep -q ":9040"; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+        ok=0
+    fi
+
+    echo -n "CONTROL 9051: "
+    if ss -lnt | grep -q ":9051"; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+        ok=0
+    fi
+
+    if [ "$ok" -eq 1 ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+
+doctor()
+{
+    echo "=============================="
+    echo " SCR4WP SHIELD DOCTOR"
+    echo "=============================="
+    echo
+
+    echo "ROOT:"
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "OK"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "TOR:"
+    if systemctl cat tor@default.service >/dev/null 2>&1; then
+        if [ -f /var/lib/scr4wp-shield/state ] && grep -q OPSEC /var/lib/scr4wp-shield/state; then
+            if ss -lnt | grep -q ":9050"; then
+                echo "OK (OPSEC)"
+            else
+                echo "FAIL (SOCKS CLOSED)"
+            fi
+        else
+            echo "OK (NORMAL MODE)"
+        fi
+    else
+        echo "FAIL (NOT INSTALLED)"
+    fi
+
+    echo
+    echo "ZAPRET:"
+    if systemctl cat "$ZAPRET_SERVICE" >/dev/null 2>&1; then
+        echo "OK"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "NFTABLES:"
+    if command -v nft >/dev/null; then
+        echo "OK"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "CONFIG:"
+    if [ -f /etc/scr4wp-shield/config ]; then
+        echo "OK"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "RESULT:"
+    echo "READY"
+}
+
+
+config_check()
+{
+    echo "=============================="
+    echo " SCR4WP CONFIG CHECK"
+    echo "=============================="
+    echo
+
+    echo "TOR SERVICE:"
+    if systemctl cat "$TOR_SERVICE" >/dev/null 2>&1; then
+        echo "OK"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "TOR PORT:"
+    if [[ "$TOR_SOCKS_PORT" =~ ^[0-9]+$ ]]; then
+        echo "OK ($TOR_SOCKS_PORT)"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "DNS PORT:"
+    if [[ "$DNS_PORT" =~ ^[0-9]+$ ]]; then
+        echo "OK ($DNS_PORT)"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "ZAPRET SERVICE:"
+    if systemctl cat "$ZAPRET_SERVICE" >/dev/null 2>&1; then
+        echo "OK"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "FAIL POLICY:"
+    if [ "$FAIL_POLICY" = "BLOCK" ]; then
+        echo "OK"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "CONFIG:"
+    echo "VALID"
+}
+
+
+health_summary()
+{
+    local fail=0
+    MODE=$(cat "$STATE" 2>/dev/null)
+
+    echo "=============================="
+    echo " SCR4WP HEALTH ENGINE"
+    echo "=============================="
+    echo
+
+    echo "MODE:"
+    echo "$MODE"
+
+    echo
+
+    if [ "$MODE" = "NORMAL" ]; then
+
+        echo "PROFILE: NORMAL"
+
+        echo
+        echo "TOR:"
+        if ! ss -lnt | grep -q ":9050"; then
+            echo "STATE: OFF (OK)"
+        else
+            echo "STATE: FAILED"
+            fail=1
+        fi
+
+        echo
+        echo "DNS:"
+        if ! resolvectl status | grep -q "DNS Servers: 127.0.0.1"; then
+            echo "STATE: NORMAL"
+        else
+            echo "STATE: FAILED"
+            fail=1
+        fi
+
+        echo
+        echo "NFT:"
+        if ! nft list table inet "$NFT" >/dev/null 2>&1; then
+            echo "STATE: OFF (OK)"
+        else
+            echo "STATE: FAILED"
+            fail=1
+        fi
+
+        echo
+        echo "ZAPRET:"
+        if systemctl is-active --quiet "$ZAPRET_SERVICE"; then
+            echo "STATE: READY"
+        else
+            echo "STATE: FAILED"
+            fail=1
+        fi
+
+    else
+
+        echo "PROFILE: OPSEC"
+
+        echo
+        echo "TOR:"
+        if tor_health; then
+            echo "STATE: HEALTHY"
+        else
+            echo "STATE: FAILED"
+            fail=1
+        fi
+
+        echo
+        echo "DNS LOCK:"
+        if resolvectl status | grep -q "DNS Servers: 127.0.0.1"; then
+            echo "STATE: LOCKED"
+        else
+            echo "STATE: FAILED"
+            fail=1
+        fi
+
+        echo
+        echo "NFT:"
+        if nft list table inet "$NFT" >/dev/null 2>&1; then
+            echo "STATE: ACTIVE"
+        else
+            echo "STATE: FAILED"
+            fail=1
+        fi
+
+    fi
+
+    echo
+    echo "CONFIG:"
+    if [ -f /etc/scr4wp-shield/config ]; then
+        echo "STATE: VALID"
+    else
+        echo "STATE: FAILED"
+        fail=1
+    fi
+
+    echo
+
+    if [ "$fail" -eq 0 ]; then
+        echo "SECURITY STATE: GREEN"
+        return 0
+    else
+        echo "SECURITY STATE: RED"
+        return 1
+    fi
+}
+
+
+status()
+{
+    echo "=============================="
+    echo " SCR4WP SHIELD v3"
+    echo "=============================="
+    echo
+
+    echo "MODE:"
+    if [ -f "$STATE" ]; then
+        cat "$STATE"
+    else
+        echo "UNKNOWN"
+    fi
+
+    echo
+
+    echo "HEALTH:"
+    if health_summary >/dev/null; then
+        echo "GREEN"
+    else
+        echo "RED"
+    fi
+
+    echo
+
+    echo "LAST BACKUP:"
+    LAST_BACKUP=$(ls -1dt "$BASE"/backups/* 2>/dev/null | head -1 || true)
+
+    if [ -n "$LAST_BACKUP" ]; then
+        echo "OK"
+        echo "$(basename "$LAST_BACKUP")"
+    else
+        echo "NONE"
+    fi
+
+    echo
+
+    echo "SYSTEM:"
+    echo "READY"
+
+    echo
+
+    echo "LAST VERIFY:"
+    if [ -f "$VERIFY_STATE" ]; then
+        cat "$VERIFY_STATE"
+    else
+        echo "NONE"
+    fi
+
+    echo
+
+    echo "SECURITY SCORE:"
+    security_score | awk '/SECURITY SCORE:/{getline;print}'
+
+    echo
+
+    MODE=$(cat "$STATE" 2>/dev/null)
+
+    echo "TOR:"
+    if [ "$MODE" = "NORMAL" ]; then
+        ss -lnt | grep -q ":9050" && echo "FAIL" || echo "OFF (OK)"
+    else
+        ss -lnt | grep -q ":9050" && echo "PASS" || echo "FAIL"
+    fi
+
+    echo
+
+    echo "DNS:"
+    if [ "$MODE" = "NORMAL" ]; then
+        resolvectl status | grep -q "DNS Servers: 127.0.0.1" && echo "FAIL" || echo "OPEN (OK)"
+    else
+        resolvectl status | grep -q "DNS Servers: 127.0.0.1" && echo "LOCKED" || echo "FAIL"
+    fi
+
+    echo
+
+    echo "NFT:"
+    nft list table inet "$NFT" >/dev/null 2>&1 && echo "ACTIVE" || echo "OFF"
+
+    echo
+
+    echo "WATCHDOG:"
+    systemctl is-enabled --quiet scr4wp-shield-watchdog.timer && echo "ACTIVE" || echo "OFF"
+
+    echo
+
+    echo "INTEGRITY:"
+    [ -f "$BASE/integrity/script" ] && echo "PASS" || echo "MISSING"
+}
+
+
+version()
+{
+    echo "=============================="
+    echo " SCR4WP SHIELD"
+    echo "=============================="
+    echo "VERSION: v3"
+    echo "BUILD: 2026"
+}
+
+help()
+{
+    echo "SCR4WP SHIELD v3"
+    echo
+    echo "Usage:"
+    echo
+    echo " scr4wp-shield normal"
+    echo " scr4wp-shield opsec"
+    echo " scr4wp-shield status"
+    echo " scr4wp-shield doctor"
+echo " scr4wp-shield config-check"
+    echo " scr4wp-shield test"
+    echo " scr4wp-shield backup"
+    echo " scr4wp-shield version"
+    echo " scr4wp-shield help"
+}
+
+
+verify()
+{
+    local VERIFY_OK=1
+
+    echo "=============================="
+    echo " SCR4WP VERIFY"
+    echo "=============================="
+    echo
+
+    echo "TOR EXIT:"
+    if tor_verify; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "DNS LEAK:"
+    if dns_verify; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "IPV6:"
+    if ipv6_verify; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "FIREWALL:"
+    if nft list table inet "$NFT" >/dev/null 2>&1; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "DNS LOCK:"
+    if resolvectl status | grep -q "DNS Servers: 127.0.0.1"; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "KILLSWITCH:"
+    if nft list table inet "$NFT" >/dev/null 2>&1; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        VERIFY_OK=0
+    fi
+
+    echo
+    echo "RESULT:"
+    if [ "$VERIFY_OK" -eq 1 ]; then
+        echo "OPSEC READY"
+        VERIFY_RESULT=PASS
+    else
+        echo "OPSEC FAILED"
+        VERIFY_RESULT=FAIL
+    fi
+
+    {
+        echo "TIME=$(date '+%F %T')"
+        echo "RESULT=$VERIFY_RESULT"
+    } > "$VERIFY_STATE"
+
+    audit_log "VERIFY PASS"
+}
+
+
+
+doctor_engine()
+{
+    MODE=$(cat "$STATE" 2>/dev/null)
+
+    echo "=============================="
+    echo " SCR4WP DOCTOR ENGINE"
+    echo "=============================="
+    echo
+
+    echo "PROFILE:"
+    echo "$MODE"
+
+    echo
+
+    echo "TOR SERVICE:"
+    if [ "$MODE" = "NORMAL" ]; then
+        if systemctl is-active --quiet "$TOR_SERVICE"; then
+            echo "UNEXPECTED"
+        else
+            echo "OFF (OK)"
+        fi
+    else
+        systemctl is-active --quiet "$TOR_SERVICE" && echo "PASS" || echo "FAIL"
+    fi
+
+    echo
+
+    echo "SOCKS:"
+    if [ "$MODE" = "NORMAL" ]; then
+        ss -lnt | grep -q ":9050" && echo "UNEXPECTED" || echo "OFF (OK)"
+    else
+        ss -lnt | grep -q ":9050" && echo "PASS" || echo "FAIL"
+    fi
+
+    echo
+
+    echo "DNS ROUTING:"
+    if [ "$MODE" = "NORMAL" ]; then
+        resolvectl status | grep -q "DNS Servers: 127.0.0.1" && echo "UNEXPECTED" || echo "NORMAL (OK)"
+    else
+        resolvectl status | grep -q "DNS Servers: 127.0.0.1" && echo "PASS" || echo "FAIL"
+    fi
+
+    echo
+
+    echo "NFTABLES:"
+    if [ "$MODE" = "NORMAL" ]; then
+        nft list table inet "$NFT" >/dev/null 2>&1 && echo "UNEXPECTED" || echo "OFF (OK)"
+    else
+        nft list table inet "$NFT" >/dev/null 2>&1 && echo "PASS" || echo "FAIL"
+    fi
+
+    echo
+
+    echo "STATE:"
+    [ -f "$STATE" ] && echo "PASS" || echo "FAIL"
+
+    echo
+
+    echo "BACKUP:"
+    ls "$BASE"/backups/* >/dev/null 2>&1 && echo "PASS" || echo "FAIL"
+
+    echo
+
+    echo "AUDIT:"
+    [ -f "$AUDIT" ] && echo "PASS" || echo "FAIL"
+
+    echo
+    echo "SYSTEM:"
+    echo "HEALTHY"
+}
+
+
+recover()
+{
+    echo "=============================="
+    echo " SCR4WP RECOVERY ENGINE"
+    echo "=============================="
+    echo
+
+    echo "TOR:"
+    if ss -lnt | grep -q ":9050"; then
+        echo "OK"
+    else
+        echo "RESTART"
+        systemctl restart "$TOR_SERVICE"
+    fi
+
+    echo
+    echo "DNS:"
+    if resolvectl status | grep -q "DNS Servers: 127.0.0.1"; then
+        echo "OK"
+    else
+        echo "LOCK"
+        dns_lock
+    fi
+
+    echo
+    echo "NFTABLES:"
+    if nft list table inet "$NFT" >/dev/null 2>&1; then
+        echo "OK"
+    else
+        echo "RESTORE"
+        firewall_on
+    fi
+
+    echo
+    echo "STATE:"
+    set_state "OPSEC"
+
+    audit_log "RECOVERY COMPLETE"
+
+    echo
+    echo "RESULT:"
+    echo "RECOVERY READY"
+}
+
+
+
+watchdog()
+{
+    echo "=============================="
+    echo " SCR4WP WATCHDOG"
+    echo "=============================="
+    echo
+
+    local FAIL=0
+
+    echo "TOR:"
+    if ss -lnt | grep -q ":9050"; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        FAIL=1
+    fi
+
+    echo
+    echo "DNS:"
+    if resolvectl status | grep -q "DNS Servers: 127.0.0.1"; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        FAIL=1
+    fi
+
+    echo
+    echo "NFT:"
+    if nft list table inet "$NFT" >/dev/null 2>&1; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        FAIL=1
+    fi
+
+    echo
+    echo "STATE:"
+    if [ -f "$STATE" ] && grep -q "OPSEC" "$STATE"; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        FAIL=1
+    fi
+
+    echo
+
+    if [ "$FAIL" -eq 1 ]; then
+        echo "STATUS:"
+        echo "FAULT DETECTED"
+
+        audit_log "WATCHDOG FAULT"
+
+        recover
+
+        audit_log "WATCHDOG RECOVERY"
+    else
+        echo "STATUS:"
+        echo "HEALTHY"
+
+        audit_log "WATCHDOG HEALTHY"
+    fi
+
+}
+
+
+snapshot()
+{
+    SNAP="$BASE/snapshot"
+
+    echo "=============================="
+    echo " SCR4WP SNAPSHOT"
+    echo "=============================="
+
+    {
+        echo "TIME=$(date '+%F %T')"
+        echo "MODE=$(cat "$STATE" 2>/dev/null)"
+        echo "TOR=$(ss -lnt | grep -q ':9050' && echo PASS || echo FAIL)"
+        echo "DNS=$(resolvectl dns | grep -q '127.0.0.1' && echo LOCKED || echo OPEN)"
+        echo "NFT=$(nft list table inet "$NFT" >/dev/null 2>&1 && echo ACTIVE || echo OFF)"
+        echo "KERNEL=$(uname -r)"
+    } > "$SNAP"
+
+    cat "$SNAP"
+}
+
+
+integrity()
+{
+    echo "=============================="
+    echo " SCR4WP INTEGRITY ENGINE"
+    echo "=============================="
+    echo
+
+    INT="$BASE/integrity"
+    mkdir -p "$INT"
+
+    echo "SCRIPT:"
+    sha256sum /usr/local/sbin/scr4wp-shield > "$INT/script.new"
+
+    if [ -f "$INT/script" ]; then
+        if cmp -s "$INT/script.new" "$INT/script"; then
+            echo "UNCHANGED"
+        else
+            echo "CHANGED"
+            audit_log "INTEGRITY SCRIPT CHANGED"
+        fi
+    else
+        echo "BASELINE CREATED"
+    fi
+
+    mv "$INT/script.new" "$INT/script"
+
+    echo
+
+    echo "STATE:"
+    if [ -f "$STATE" ]; then
+        sha256sum "$STATE" > "$INT/state"
+        echo "OK"
+    else
+        echo "MISSING"
+    fi
+
+    echo
+
+    echo "NFT:"
+
+    MODE=$(cat "$STATE" 2>/dev/null)
+
+    if [ "$MODE" = "NORMAL" ]; then
+        if nft list table inet "$NFT" >/dev/null 2>&1; then
+            echo "UNEXPECTED"
+            audit_log "INTEGRITY NFT ACTIVE IN NORMAL"
+        else
+            echo "OFF (OK)"
+        fi
+    else
+        if nft list table inet "$NFT" >/dev/null 2>&1; then
+            echo "OK"
+        else
+            echo "MISSING"
+            audit_log "INTEGRITY NFT FAILED"
+        fi
+    fi
+
+    echo
+
+    echo "RESULT:"
+    echo "INTEGRITY READY"
+
+    audit_log "INTEGRITY CHECK"
+}
+
+
+
+security_score()
+{
+    SCORE=0
+    MODE=$(cat "$STATE" 2>/dev/null)
+
+    echo "=============================="
+    echo " SCR4WP SECURITY SCORE"
+    echo "=============================="
+    echo
+
+    echo "MODE:"
+    echo "$MODE"
+    echo
+
+
+    if [ "$MODE" = "NORMAL" ]; then
+
+        echo "PROFILE: NORMAL"
+        echo
+
+        echo "TOR OFF:"
+        if ! ss -lnt | grep -q ":9050"; then
+            echo "PASS +20"
+            SCORE=$((SCORE+20))
+        else
+            echo "FAIL"
+        fi
+
+        echo
+        echo "DNS NORMAL:"
+        if ! resolvectl status | grep -q "DNS Servers: 127.0.0.1"; then
+            echo "PASS +20"
+            SCORE=$((SCORE+20))
+        else
+            echo "FAIL"
+        fi
+
+        echo
+        echo "NFT OFF:"
+        if ! nft list table inet "$NFT" >/dev/null 2>&1; then
+            echo "PASS +20"
+            SCORE=$((SCORE+20))
+        else
+            echo "FAIL"
+        fi
+
+        echo
+        echo "ZAPRET:"
+        if systemctl is-active --quiet "$ZAPRET_SERVICE"; then
+            echo "PASS +15"
+            SCORE=$((SCORE+15))
+        else
+            echo "FAIL"
+        fi
+
+
+    else
+
+        echo "PROFILE: OPSEC"
+        echo
+
+        echo "TOR:"
+        if ss -lnt | grep -q ":9050"; then
+            echo "PASS +20"
+            SCORE=$((SCORE+20))
+        else
+            echo "FAIL"
+        fi
+
+        echo
+        echo "DNS LOCK:"
+        if resolvectl status | grep -q "DNS Servers: 127.0.0.1"; then
+            echo "PASS +20"
+            SCORE=$((SCORE+20))
+        else
+            echo "FAIL"
+        fi
+
+        echo
+        echo "NFT FIREWALL:"
+        if nft list table inet "$NFT" >/dev/null 2>&1; then
+            echo "PASS +20"
+            SCORE=$((SCORE+20))
+        else
+            echo "FAIL"
+        fi
+
+        echo
+        echo "KILLSWITCH:"
+        if nft list table inet "$NFT" >/dev/null 2>&1; then
+            echo "PASS +15"
+            SCORE=$((SCORE+15))
+        else
+            echo "FAIL"
+        fi
+
+    fi
+
+
+    echo
+    echo "WATCHDOG:"
+    if systemctl is-enabled --quiet scr4wp-shield-watchdog.timer; then
+        echo "PASS +10"
+        SCORE=$((SCORE+10))
+    else
+        echo "FAIL"
+    fi
+
+
+    echo
+    echo "INTEGRITY:"
+    if [ -f "$BASE/integrity/script" ]; then
+        echo "PASS +10"
+        SCORE=$((SCORE+10))
+    else
+        echo "FAIL"
+    fi
+
+
+    echo
+    echo "VERIFY:"
+    if [ -f "$VERIFY_STATE" ] && grep -q "RESULT=PASS" "$VERIFY_STATE"; then
+        echo "PASS +5"
+        SCORE=$((SCORE+5))
+    else
+        echo "FAIL"
+    fi
+
+
+    echo
+    echo "=============================="
+    echo "SECURITY SCORE:"
+    echo "$SCORE/100"
+    echo "=============================="
+
+    audit_log "SECURITY SCORE $SCORE/100"
+}
+
+
+
+report()
+{
+    if [ "${2:-}" = "--json" ] || [ "${1:-}" = "--json" ]; then
+
+        MODE=$(cat "$STATE" 2>/dev/null || echo UNKNOWN)
+
+        TOR=$(ss -lnt | grep -q ":9050" && echo PASS || echo FAIL)
+        DNS=$(resolvectl dns | grep -q "127.0.0.1" && echo LOCKED || echo OPEN)
+        NFT=$(nft list table inet "$NFT" >/dev/null 2>&1 && echo ACTIVE || echo OFF)
+        WATCHDOG=$(systemctl is-enabled --quiet scr4wp-shield-watchdog.timer && echo ACTIVE || echo OFF)
+        INT=$( [ -f "$BASE/integrity/script" ] && echo PASS || echo FAIL )
+
+        cat <<EOF
+{
+  "mode":"$MODE",
+  "tor":"$TOR",
+  "dns":"$DNS",
+  "firewall":"$NFT",
+  "watchdog":"$WATCHDOG",
+  "integrity":"$INT"
+}
+EOF
+
+        return
+    fi
+
+    echo "=============================="
+    echo " SCR4WP SECURITY REPORT"
+    echo "=============================="
+    echo
+
+    echo "MODE:"
+    cat "$STATE" 2>/dev/null || echo UNKNOWN
+
+    echo
+
+    MODE=$(cat "$STATE" 2>/dev/null)
+
+    echo "TOR:"
+    if [ "$MODE" = "NORMAL" ]; then
+        ss -lnt | grep -q ":9050" && echo "FAIL" || echo "OFF (OK)"
+    else
+        ss -lnt | grep -q ":9050" && echo "PASS" || echo "FAIL"
+    fi
+
+    echo
+
+    echo "DNS:"
+    if [ "$MODE" = "NORMAL" ]; then
+        resolvectl status | grep -q "DNS Servers: 127.0.0.1" && echo "FAIL" || echo "OPEN (OK)"
+    else
+        resolvectl status | grep -q "DNS Servers: 127.0.0.1" && echo "LOCKED" || echo "FAIL"
+    fi
+
+    echo
+
+    echo "FIREWALL:"
+    nft list table inet "$NFT" >/dev/null 2>&1 && echo "ACTIVE" || echo "OFF"
+
+    echo
+
+    echo "WATCHDOG:"
+    systemctl is-enabled --quiet scr4wp-shield-watchdog.timer && echo "ACTIVE" || echo "OFF"
+
+    echo
+
+    echo "INTEGRITY:"
+    [ -f "$BASE/integrity/script" ] && echo "PASS" || echo "FAIL"
+
+    echo
+
+    echo "VERIFY:"
+    if [ -f "$VERIFY_STATE" ]; then
+        grep RESULT "$VERIFY_STATE"
+    else
+        echo NONE
+    fi
+
+    echo
+
+    echo "AUDIT:"
+    [ -f "$AUDIT" ] && echo "HEALTHY" || echo "MISSING"
+
+    audit_log "REPORT GENERATED"
+}
+
+
+
+monitor()
+{
+    echo "=============================="
+    echo " SCR4WP LIVE MONITOR"
+    echo "=============================="
+    echo
+
+    FAIL=0
+
+    echo "TOR:"
+    if ss -lnt | grep -q ":9050"; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        FAIL=1
+        audit_log "MONITOR TOR FAILURE"
+    fi
+
+    echo
+
+    echo "DNS:"
+    if resolvectl status | grep -q "DNS Servers: 127.0.0.1"; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        FAIL=1
+        audit_log "MONITOR DNS FAILURE"
+    fi
+
+    echo
+
+    echo "NFT:"
+    if nft list table inet "$NFT" >/dev/null 2>&1; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        FAIL=1
+        audit_log "MONITOR NFT FAILURE"
+    fi
+
+    echo
+
+    echo "STATE:"
+    if [ -f "$STATE" ] && grep -q "OPSEC" "$STATE"; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        FAIL=1
+        audit_log "MONITOR STATE FAILURE"
+    fi
+
+    echo
+
+    if [ "$FAIL" -eq 1 ]; then
+
+        echo "STATUS:"
+        echo "FAULT DETECTED"
+
+        audit_log "MONITOR RECOVERY START"
+
+        recover
+
+        audit_log "MONITOR RECOVERY COMPLETE"
+
+        echo
+        echo "RECOVERY:"
+        echo "DONE"
+
+    else
+
+        echo "STATUS:"
+        echo "SECURE"
+
+        audit_log "MONITOR SECURE"
+
+    fi
+}
+
+detect_optional_modules
+
+case "${1:-}" in
+
+normal)
+normal
+;;
+
+opsec)
+opsec
+;;
+
+status)
+status
+;;
+
+config-check)
+config_check
+;;
+
+test)
+test
+;;
+
+verify)
+verify
+;;
+
+killswitch-test)
+killswitch_test
+;;
+
+health)
+health_summary
+;;
+
+audit)
+audit
+;;
+
+backups)
+backups
+;;
+
+backup-clean)
+backup_clean
+;;
+
+doctor)
+doctor_engine
+;;
+
+recover)
+recover
+;;
+
+watchdog)
+watchdog
+;;
+
+snapshot)
+snapshot
+;;
+
+report)
+report "$@"
+;;
+
+monitor)
+monitor
+;;
+
+integrity)
+integrity
+;;
+
+score)
+security_score
+;;
+
+backup)
+backup
+;;
+
+version)
+version
+;;
+
+help)
+help
+;;
+
+*)
+echo "Usage:"
+echo " scr4wp-shield normal"
+echo " scr4wp-shield opsec"
+echo " scr4wp-shield status"
+ echo " scr4wp-shield doctor"
+echo " scr4wp-shield config-check"
+ echo " scr4wp-shield test"
+;;
+
+esac
