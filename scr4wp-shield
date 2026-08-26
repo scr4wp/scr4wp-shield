@@ -1219,6 +1219,78 @@ recover()
 
 watchdog()
 {
+    # SCR4WP_WATCHDOG_PROFILE_GUARD
+    CURRENT_MODE="$(cat "$STATE" 2>/dev/null || echo UNKNOWN)"
+
+    # NORMAL is intentionally non-OPSEC.
+    # Never turn NORMAL into OPSEC automatically.
+    if [ "$CURRENT_MODE" = "NORMAL" ]; then
+        DRIFT=0
+
+        echo "=============================="
+        echo " SCR4WP WATCHDOG"
+        echo "=============================="
+        echo
+        echo "PROFILE:"
+        echo "NORMAL"
+        echo
+
+        echo "TOR:"
+        if systemctl is-active --quiet "$TOR_SERVICE"; then
+            echo "ACTIVE (DRIFT)"
+            DRIFT=1
+        else
+            echo "OFF (OK)"
+        fi
+
+        echo
+        echo "DNS:"
+        if resolvectl status 2>/dev/null | grep -q "DNS Servers: 127.0.0.1"; then
+            echo "LOCKED (DRIFT)"
+            DRIFT=1
+        else
+            echo "OPEN (OK)"
+        fi
+
+        echo
+        echo "NFT:"
+        if nft list table inet "$NFT" >/dev/null 2>&1; then
+            echo "ACTIVE (DRIFT)"
+            DRIFT=1
+        else
+            echo "OFF (OK)"
+        fi
+
+        echo
+        echo "STATE:"
+        echo "PASS"
+        echo
+        echo "STATUS:"
+
+        if [ "$DRIFT" -eq 0 ]; then
+            echo "HEALTHY"
+            return 0
+        fi
+
+        echo "DRIFT DETECTED"
+        echo "AUTO-RECOVERY DISABLED IN NORMAL"
+        return 1
+    fi
+
+    # Never run OPSEC recovery from an unknown/corrupt state.
+    if [ "$CURRENT_MODE" != "OPSEC" ]; then
+        echo "=============================="
+        echo " SCR4WP WATCHDOG"
+        echo "=============================="
+        echo
+        echo "PROFILE:"
+        echo "$CURRENT_MODE"
+        echo
+        echo "STATUS:"
+        echo "UNKNOWN STATE - NO AUTO-RECOVERY"
+        return 1
+    fi
+
     echo "=============================="
     echo " SCR4WP WATCHDOG"
     echo "=============================="

@@ -1,4 +1,4 @@
-# 🛡️ SCR4WP Shield v3.2
+# 🛡️ SCR4WP Shield v3.2.1
 
 ## ⚡ Advanced Linux Privacy & OPSEC Security Framework
 
@@ -197,4 +197,4 @@ See the [LICENSE](LICENSE) file for details.
 
 # 🏷️ Release
 
-SCR4WP Shield v3.2 Final
+SCR4WP Shield v3.2.1 Final
