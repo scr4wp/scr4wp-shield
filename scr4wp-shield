@@ -901,7 +901,7 @@ health_summary()
 status()
 {
     echo "=============================="
-    echo " SCR4WP SHIELD v3"
+    echo " SCR4WP SHIELD v3.2.1"
     echo "=============================="
     echo
 
@@ -1000,7 +1000,7 @@ version()
 
 help()
 {
-    echo "SCR4WP SHIELD v3"
+    echo "SCR4WP SHIELD v3.2.1"
     echo
     echo "Usage:"
     echo
