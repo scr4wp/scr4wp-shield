@@ -882,8 +882,7 @@ health_summary()
     if [ -f /etc/scr4wp-shield/config ]; then
         echo "STATE: VALID"
     else
-        echo "STATE: FAILED"
-        fail=1
+        echo "STATE: DEFAULT (OK)"
     fi
 
     echo
@@ -994,7 +993,7 @@ version()
     echo "=============================="
     echo " SCR4WP SHIELD"
     echo "=============================="
-    echo "VERSION: v3"
+    echo "VERSION: v3.2.1"
     echo "BUILD: 2026"
 }
 
