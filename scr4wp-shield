@@ -699,14 +699,6 @@ doctor()
         echo "FAIL (NOT INSTALLED)"
     fi
 
-    echo
-    echo "ZAPRET:"
-    if systemctl cat "$ZAPRET_SERVICE" >/dev/null 2>&1; then
-        echo "OK"
-    else
-        echo "FAIL"
-        VERIFY_OK=0
-    fi
 
     echo
     echo "NFTABLES:"
@@ -765,14 +757,6 @@ config_check()
         VERIFY_OK=0
     fi
 
-    echo
-    echo "ZAPRET SERVICE:"
-    if systemctl cat "$ZAPRET_SERVICE" >/dev/null 2>&1; then
-        echo "OK"
-    else
-        echo "FAIL"
-        VERIFY_OK=0
-    fi
 
     echo
     echo "FAIL POLICY:"
@@ -835,14 +819,6 @@ health_summary()
             fail=1
         fi
 
-        echo
-        echo "ZAPRET:"
-        if systemctl is-active --quiet "$ZAPRET_SERVICE"; then
-            echo "STATE: READY"
-        else
-            echo "STATE: FAILED"
-            fail=1
-        fi
 
     else
 
@@ -1464,8 +1440,8 @@ security_score()
 
         echo "TOR OFF:"
         if ! ss -lnt | grep -q ":9050"; then
-            echo "PASS +20"
-            SCORE=$((SCORE+20))
+            echo "PASS +25"
+            SCORE=$((SCORE+25))
         else
             echo "FAIL"
         fi
@@ -1473,8 +1449,8 @@ security_score()
         echo
         echo "DNS NORMAL:"
         if ! resolvectl status | grep -q "DNS Servers: 127.0.0.1"; then
-            echo "PASS +20"
-            SCORE=$((SCORE+20))
+            echo "PASS +25"
+            SCORE=$((SCORE+25))
         else
             echo "FAIL"
         fi
@@ -1482,17 +1458,8 @@ security_score()
         echo
         echo "NFT OFF:"
         if ! nft list table inet "$NFT" >/dev/null 2>&1; then
-            echo "PASS +20"
-            SCORE=$((SCORE+20))
-        else
-            echo "FAIL"
-        fi
-
-        echo
-        echo "ZAPRET:"
-        if systemctl is-active --quiet "$ZAPRET_SERVICE"; then
-            echo "PASS +15"
-            SCORE=$((SCORE+15))
+            echo "PASS +25"
+            SCORE=$((SCORE+25))
         else
             echo "FAIL"
         fi
